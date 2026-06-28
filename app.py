@@ -5,6 +5,12 @@ import re
 import pickle
 import os
 
+# Try to import joblib to handle sklearn/joblib serialization fallbacks
+try:
+    import joblib
+except ImportError:
+    joblib = None
+
 # ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Veritas AI - Professional News Verification",
@@ -87,7 +93,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Helper Text Cleaning ──────────────────────────────────────────────────────
 def clean_news_text(text):
     """Normalize news article text to avoid formatting/punctuation biases."""
     text = str(text).lower()
@@ -104,7 +109,6 @@ def clean_news_text(text):
     text = re.sub(r'\s+', ' ', text).strip() # Multi spaces
     return text
 
-# ── Model Loading (Safe Handling & Traceback Diagnostics) ─────────────────────
 @st.cache_resource
 def load_production_model():
     """Loads the pre-trained model pipeline. Safely handles and captures errors."""
@@ -128,18 +132,38 @@ def load_production_model():
             
     if model_file_match:
         try:
+            # First, read the header of the file to see if it is a Git LFS pointer
+            with open(model_file_match, "rb") as test_file:
+                head = test_file.read(100)
+                if b"version https://git-lfs" in head:
+                    return None, None, "GitLFSPointer"
+            
+            # 1. Try Standard Pickle Load
             with open(model_file_match, "rb") as file_obj:
-                model = pickle.load(file_obj)
-            return model, None, "Success"
+                try:
+                    model = pickle.load(file_obj)
+                    return model, None, "Success"
+                except Exception as pickle_err:
+                    # 2. Try Joblib Load as a fallback (resolves the invalid load key error)
+                    if joblib is not None:
+                        try:
+                            # Seek back to start and attempt joblib load
+                            file_obj.seek(0)
+                            model = joblib.load(file_obj)
+                            return model, None, "Success"
+                        except Exception as job_err:
+                            combined_error = Exception(f"Pickle error: {pickle_err} | Joblib error: {job_err}")
+                            return None, combined_error, "PickleLoadError"
+                    else:
+                        return None, pickle_err, "PickleLoadError"
+                        
         except Exception as e:
-            # File exists but crashed during pickle parsing
             return None, e, "PickleLoadError"
             
     return None, None, "FileNotFound"
 
 model, model_error, error_status = load_production_model()
 
-# ── Sidebar Navigation & Calibration ─────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🛡️ Veritas AI Panel")
     st.markdown("Veritas AI uses natural language processing to evaluate semantic structures, clickbait signals, and linguistic credibility markers.")
@@ -163,7 +187,6 @@ with st.sidebar:
 st.markdown("<h1 class='brand-title'>🛡️ Veritas AI</h1>", unsafe_allow_html=True)
 st.markdown("<p class='brand-subtitle'>State-of-the-art computational news veracity verification.</p>", unsafe_allow_html=True)
 
-# ── Display Troubleshooting Panel if Model Load Fails ────────────────────────
 if model is None:
     st.markdown("""
     <div style="background-color: #FFFBEB; border-left: 6px solid #F59E0B; padding: 2rem; border-radius: 16px; margin-bottom: 2rem;">
@@ -184,16 +207,29 @@ if model is None:
         st.code("\n".join([f"📄 {file}" for file in all_local_files if not file.startswith(".")]))
         
         # Guide based on file presence
-        model_exists_case_insensitive = any(f.lower() == "model.pkl" for f in all_local_files)
+        model_exists_case_insensitive = any(f.lower() == "fake_news_model.pkl" or f.lower() == "model.pkl" for f in all_local_files)
         if not model_exists_case_insensitive:
-            st.error("❌ **Result:** `model.pkl` was not found anywhere in the root directory. Please double-check that you uploaded it to the exact same folder as `app.py` on GitHub.")
+            st.error("❌ **Result:** `fake_news_model.pkl` was not found anywhere in the root directory. Please double-check that you uploaded it to the exact same folder as `app.py` on GitHub.")
         else:
-            st.success("✅ **Result:** A `model.pkl` file exists in your folder! The issue is a load crash.")
+            st.success("✅ **Result:** A model file exists in your folder! The issue is a load crash.")
 
     with col_diag_right:
         st.subheader("🐞 Crash Error Log")
         if error_status == "FileNotFound":
-            st.warning("No model.pkl was found, so no loading error could be generated.")
+            st.warning("No fake_news_model.pkl was found, so no loading error could be generated.")
+            
+        elif error_status == "GitLFSPointer":
+            st.error("❌ **Result: Git LFS Pointer Detected!**")
+            st.write(
+                "Your model was pushed to GitHub using Git LFS, but Streamlit cloned only the 130-byte text 'pointer' instead of the real file. "
+                "This causes pickle to crash."
+            )
+            st.markdown("#### How to fix this Git LFS Pointer Issue:")
+            st.info(
+                "💡 **Fix:** Deactivate git LFS on your repository, delete the file on GitHub, and re-upload the `fake_news_model.pkl` file "
+                "directly using the GitHub web interface (drag & drop), which bypasses LFS and uploads the actual binary file."
+            )
+            
         elif error_status == "PickleLoadError":
             st.error(f"Failed to open/unpack your pickle file. Python returned the following error:")
             st.code(f"{type(model_error).__name__}: {model_error}")
@@ -202,6 +238,11 @@ if model is None:
             st.markdown("#### How to fix this error:")
             if "sklearn" in str(model_error) or "ModuleNotFoundError" in str(model_error):
                 st.info("💡 **Fix:** You forgot to tell Streamlit to install `scikit-learn`. Create a file in your GitHub repository named **`requirements.txt`** and write `scikit-learn` inside it.")
+            elif "UnpicklingError" in str(model_error) and "invalid load key" in str(model_error):
+                st.info(
+                    "💡 **Fix:** This is a serialization mismatch! It means the file was exported with `joblib.dump()` but is being opened as standard `pickle` or vice-versa. "
+                    "Make sure your offline training script imports `joblib` (or `pickle`), and saves the model using standard `pickle.dump(model, open('fake_news_model.pkl', 'wb'))` before uploading."
+                )
             elif "AttributeError" in str(model_error):
                 st.info("💡 **Fix:** This is a serialization mismatch. This happens if you used a custom function during training that is not declared in your `app.py`, or if your local version of scikit-learn is different from Streamlit's.")
             else:
@@ -211,7 +252,6 @@ if model is None:
     st.subheader("💡 Sandbox Mode (Interactive Evaluation Preview)")
     st.caption("Since your production model is not loaded yet, you can test-drive the layout below using sandbox parameters.")
 
-# ── Text Entry Layout ─────────────────────────────────────────────────────────
 headline_input = st.text_input("Article Headline (Optional):", placeholder="e.g., Global Markets Surge Amid New Economic Forecasts")
 article_input = st.text_area("Article Body Content:", placeholder="Paste the full body text of the news article here...", height=220)
 
@@ -219,7 +259,6 @@ col_button, _ = st.columns([1, 2])
 with col_button:
     evaluate_clicked = st.button("Verify Credibility Index", type="primary", use_container_width=True)
 
-# ── Run Evaluation Block ─────────────────────────────────────────────────────
 if evaluate_clicked and article_input:
     # 1. Structural Analytics
     word_count = len(article_input.split())
@@ -318,7 +357,6 @@ if evaluate_clicked and article_input:
             unsafe_allow_html=True
         )
 
-# ── Footer ───────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #94A3B8; font-size: 0.9rem;'>Veritas AI Verification Engine • Built with Streamlit, Scikit-Learn & Python</p>",
