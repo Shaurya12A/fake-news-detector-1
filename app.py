@@ -104,21 +104,40 @@ def clean_news_text(text):
     text = re.sub(r'\s+', ' ', text).strip() # Multi spaces
     return text
 
-# ── Model Loading (Safe Handling) ─────────────────────────────────────────────
+# ── Model Loading (Safe Handling & Traceback Diagnostics) ─────────────────────
 @st.cache_resource
 def load_production_model():
-    """Loads the pre-trained model pipeline. Safely handles missing files."""
-    model_path = "model.pkl"
-    if os.path.exists(model_path):
+    """Loads the pre-trained model pipeline. Safely handles and captures errors."""
+    # Look for model files matching standard formats (case-insensitive checks)
+    files_in_dir = os.listdir(".")
+    model_file_match = None
+    
+    # Priority list of filenames we are looking for
+    targets = ["fake_news_model.pkl", "model.pkl"]
+    for f in files_in_dir:
+        if f.lower() in targets:
+            model_file_match = f
+            break
+            
+    # Fallback: scan for any .pkl file containing "model"
+    if not model_file_match:
+        for f in files_in_dir:
+            if f.lower().endswith(".pkl") and "model" in f.lower():
+                model_file_match = f
+                break
+            
+    if model_file_match:
         try:
-            with open(model_path, "rb") as f:
-                model = pickle.load(f)
-            return model, None
+            with open(model_file_match, "rb") as file_obj:
+                model = pickle.load(file_obj)
+            return model, None, "Success"
         except Exception as e:
-            return None, f"Error loading model pickle: {e}"
-    return None, "Model file 'model.pkl' not found."
+            # File exists but crashed during pickle parsing
+            return None, e, "PickleLoadError"
+            
+    return None, None, "FileNotFound"
 
-model, model_error = load_production_model()
+model, model_error, error_status = load_production_model()
 
 # ── Sidebar Navigation & Calibration ─────────────────────────────────────────
 with st.sidebar:
@@ -144,26 +163,53 @@ with st.sidebar:
 st.markdown("<h1 class='brand-title'>🛡️ Veritas AI</h1>", unsafe_allow_html=True)
 st.markdown("<p class='brand-subtitle'>State-of-the-art computational news veracity verification.</p>", unsafe_allow_html=True)
 
-# ── Display Missing Model Setup Guide if Model Not Present ───────────────────
+# ── Display Troubleshooting Panel if Model Load Fails ────────────────────────
 if model is None:
     st.markdown("""
     <div style="background-color: #FFFBEB; border-left: 6px solid #F59E0B; padding: 2rem; border-radius: 16px; margin-bottom: 2rem;">
-        <h3 style="color: #92400E; margin-top: 0;">📦 Model Integration Required</h3>
+        <h3 style="color: #92400E; margin-top: 0;">⚠️ Model Loader Diagnostics</h3>
         <p style="color: #78350F; font-size: 1.05rem;">
-            Veritas AI is successfully configured! To complete deployment, make sure your trained <code>model.pkl</code> file is uploaded to the root directory of your GitHub repository.
+            Your app.py file is live, but your machine learning model is not running yet. Use the diagnostics below to identify the issue.
         </p>
-        <h4 style="color: #92400E; margin-bottom: 0.5rem;">Quick Setup Instructions:</h4>
-        <ol style="color: #78350F; line-height: 1.6;">
-            <li>Save your trained classifier pipeline using <code>pickle.dump(pipeline, open('model.pkl', 'wb'))</code>.</li>
-            <li>Commit and push the <code>model.pkl</code> file to your active GitHub repository alongside this <code>app.py</code>.</li>
-            <li>Once pushed, Streamlit Community Cloud will automatically reload and enable live machine learning evaluations.</li>
-        </ol>
     </div>
     """, unsafe_allow_html=True)
+
+    col_diag_left, col_diag_right = st.columns(2)
     
-    # Showcase interactive placeholder mode for demo/presentation purposes
+    with col_diag_left:
+        st.subheader("📁 Directory Contents Audit")
+        st.write("Here are the files Streamlit actually sees in your root folder right now:")
+        all_local_files = os.listdir(".")
+        # Filter files to make it clean
+        st.code("\n".join([f"📄 {file}" for file in all_local_files if not file.startswith(".")]))
+        
+        # Guide based on file presence
+        model_exists_case_insensitive = any(f.lower() == "model.pkl" for f in all_local_files)
+        if not model_exists_case_insensitive:
+            st.error("❌ **Result:** `model.pkl` was not found anywhere in the root directory. Please double-check that you uploaded it to the exact same folder as `app.py` on GitHub.")
+        else:
+            st.success("✅ **Result:** A `model.pkl` file exists in your folder! The issue is a load crash.")
+
+    with col_diag_right:
+        st.subheader("🐞 Crash Error Log")
+        if error_status == "FileNotFound":
+            st.warning("No model.pkl was found, so no loading error could be generated.")
+        elif error_status == "PickleLoadError":
+            st.error(f"Failed to open/unpack your pickle file. Python returned the following error:")
+            st.code(f"{type(model_error).__name__}: {model_error}")
+            
+            # Actionable tips for pickle loading failures
+            st.markdown("#### How to fix this error:")
+            if "sklearn" in str(model_error) or "ModuleNotFoundError" in str(model_error):
+                st.info("💡 **Fix:** You forgot to tell Streamlit to install `scikit-learn`. Create a file in your GitHub repository named **`requirements.txt`** and write `scikit-learn` inside it.")
+            elif "AttributeError" in str(model_error):
+                st.info("💡 **Fix:** This is a serialization mismatch. This happens if you used a custom function during training that is not declared in your `app.py`, or if your local version of scikit-learn is different from Streamlit's.")
+            else:
+                st.info("💡 **Fix:** Try exporting your model using a standard pipeline and uploading it again.")
+                
+    st.markdown("---")
     st.subheader("💡 Sandbox Mode (Interactive Evaluation Preview)")
-    st.caption("Since 'model.pkl' is not loaded yet, you can test-drive the UI structure below.")
+    st.caption("Since your production model is not loaded yet, you can test-drive the layout below using sandbox parameters.")
 
 # ── Text Entry Layout ─────────────────────────────────────────────────────────
 headline_input = st.text_input("Article Headline (Optional):", placeholder="e.g., Global Markets Surge Amid New Economic Forecasts")
