@@ -159,6 +159,7 @@ with col_sidebar:
     model = None
     vectorizer = None
     is_custom_model = False
+    is_pipeline = False
     
     if "1." in model_source:
         st.info("💡 Mode 1 trains a toy TF-IDF + Logistic Regression model directly in RAM. You can toggle 'Reuters bias' to see feature leakage.")
@@ -169,18 +170,40 @@ with col_sidebar:
         
     else:
         is_custom_model = True
-        st.info("📂 Upload your trained artifacts. Make sure they were exported using `pickle` or `joblib`.")
-        uploaded_model = st.file_uploader("Upload Model File (model.pkl)", type=["pkl", "bin", "sav"])
-        uploaded_vec = st.file_uploader("Upload Vectorizer File (vectorizer.pkl)", type=["pkl", "bin", "sav"])
+        st.info("📂 Upload your trained artifacts. If your model contains the vectorization pipeline internally, you do not need to upload a separate vectorizer file.")
         
-        if uploaded_model and uploaded_vec:
+        uploaded_model = st.file_uploader("Upload Model File (model.pkl)", type=["pkl", "bin", "sav"])
+        uploaded_vec = st.file_uploader("Upload Vectorizer File (Optional - vectorizer.pkl)", type=["pkl", "bin", "sav"])
+        
+        if uploaded_model:
             try:
                 model = pickle.load(uploaded_model)
-                vectorizer = pickle.load(uploaded_vec)
-                st.success("✅ Custom artifacts loaded successfully!")
+                st.success("✅ Model loaded successfully!")
+                
+                # Check if loaded model is a Scikit-Learn Pipeline or wraps vectorization steps
+                model_class_name = type(model).__name__
+                if "Pipeline" in model_class_name or hasattr(model, "steps"):
+                    is_pipeline = True
+                    st.info("📦 **Pipeline Detected:** Your model includes built-in vectorization. A separate vectorizer file is NOT required.")
+                    
+                    # Try to extract the vectorizer from the pipeline steps for vocabulary diagnostics
+                    for step_name, step_obj in model.steps:
+                        if hasattr(step_obj, "get_feature_names_out") or hasattr(step_obj, "vocabulary_"):
+                            vectorizer = step_obj
+                            st.caption(f"ℹ️ Found internal vectorizer step: `{step_name}` ({type(step_obj).__name__})")
+                            break
+                else:
+                    st.warning("⚠️ This model does not appear to be a Pipeline. You will likely need to upload a separate vectorizer file below.")
+                
+                # Load custom vectorizer if manually supplied
+                if uploaded_vec:
+                    vectorizer = pickle.load(uploaded_vec)
+                    is_pipeline = False # Explicit vectorizer provided overrides internal pipeline extraction
+                    st.success("✅ Custom vectorizer loaded successfully!")
+                    
             except Exception as e:
                 st.error(f"❌ Failed to load artifacts: {e}")
-                st.warning("Please ensure both your model and vectorizer were serialized in the same Python environment.")
+                st.warning("Please ensure your model was serialized properly in Python.")
 
     st.markdown("---")
     st.header("🧪 Diagnostic Audits")
@@ -222,8 +245,10 @@ with col_main:
     run_diagnostics = st.button("Run Model Diagnostics", type="primary", use_container_width=True)
     
     if run_diagnostics and input_text:
-        if model is None or vectorizer is None:
-            st.error("⚠️ Please select/upload a valid model and vectorizer first.")
+        if model is None:
+            st.error("⚠️ Please upload your model file first.")
+        elif not is_pipeline and vectorizer is None:
+            st.error("⚠️ This model requires an external vectorizer. Please upload a vectorizer.pkl file on the sidebar.")
         else:
             # Step 1: Pre-process
             cleaned_text_raw = clean_news_text(input_text, remove_sources=False)
@@ -235,20 +260,26 @@ with col_main:
             
             # Step 2: Transform input vector
             try:
-                vectorized_input = vectorizer.transform([cleaned_text_sanitized])
+                if is_pipeline:
+                    # Pipelines take raw strings directly as input
+                    model_input = [cleaned_text_sanitized]
+                else:
+                    # Standalone models take vectorized input arrays
+                    model_input = vectorizer.transform([cleaned_text_sanitized])
                 
                 # Calculate class probabilities
                 if hasattr(model, "predict_proba"):
-                    probs = model.predict_proba(vectorized_input)[0]
+                    probs = model.predict_proba(model_input)[0]
                     # Map classes. Usually Class 1 is Real, Class 0 is Fake.
-                    # We handle robust checks if model classes are custom.
                     real_class_idx = 1 if len(model.classes_) > 1 else 0
                     prob_real = probs[real_class_idx]
                     prob_fake = 1.0 - prob_real
                 else:
                     # Fallback for models without predict_proba (like SVM without probability=True)
-                    decision = model.decision_function(vectorized_input)[0]
-                    prob_real = 1 / (1 + np.exp(-decision)) # Sigmoid mapping
+                    decision = model.decision_function(model_input)[0]
+                    # Handle multi-class vs binary output shape in decision_function
+                    val = decision[0] if hasattr(decision, "__len__") else decision
+                    prob_real = 1 / (1 + np.exp(-val)) # Sigmoid mapping
                     prob_fake = 1.0 - prob_real
                 
                 # Apply custom threshold adjustment
@@ -290,44 +321,56 @@ with col_main:
                 # ── SECTION B: Vocabulary Matcher (The Crucial Diagnosis) ─────
                 st.markdown("### 🔍 Feature Vocabulary Overlap Analysis")
                 
-                # Tokenize the user's input words
-                words = cleaned_text_sanitized.split()
-                feature_names = vectorizer.get_feature_names_out()
-                vocab_set = set(feature_names)
-                
-                matching_words = [w for w in words if w in vocab_set]
-                ignored_words = [w for w in words if w not in vocab_set]
-                
-                overlap_percent = len(matching_words) / len(words) if len(words) > 0 else 0
-                
-                st.write(f"**Text Length:** {len(words)} words | **Matching Vocabulary Features:** {len(matching_words)} words")
-                
-                # Display warning if overlap is exceptionally low
-                if overlap_percent < 0.15:
-                    st.markdown(
-                        f"""
-                        <div class='card card-warning'>
-                            ⚠️ <b>Critical Warning: Low Vocabulary Overlap ({overlap_percent:.1%})</b><br/>
-                            Your vectorizer only recognized <b>{len(matching_words)} out of {len(words)} words</b>. 
-                            Because the vocabulary doesn't match the training data, the vector is almost empty, 
-                            forcing the model to default to its baseline mathematical bias (which is often to predict 'Fake'). 
-                            Ensure you aren't resetting the vectorizer using <code>fit_transform()</code> in Streamlit!
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+                if vectorizer is not None:
+                    # Tokenize the user's input words
+                    words = cleaned_text_sanitized.split()
+                    
+                    try:
+                        feature_names = vectorizer.get_feature_names_out()
+                    except AttributeError:
+                        # Fallback for older vectorizer versions
+                        feature_names = vectorizer.get_feature_names() if hasattr(vectorizer, "get_feature_names") else []
+                        
+                    vocab_set = set(feature_names)
+                    
+                    if len(vocab_set) > 0:
+                        matching_words = [w for w in words if w in vocab_set]
+                        ignored_words = [w for w in words if w not in vocab_set]
+                        
+                        overlap_percent = len(matching_words) / len(words) if len(words) > 0 else 0
+                        
+                        st.write(f"**Text Length:** {len(words)} words | **Matching Vocabulary Features:** {len(matching_words)} words")
+                        
+                        # Display warning if overlap is exceptionally low
+                        if overlap_percent < 0.15:
+                            st.markdown(
+                                f"""
+                                <div class='card card-warning'>
+                                    ⚠️ <b>Critical Warning: Low Vocabulary Overlap ({overlap_percent:.1%})</b><br/>
+                                    Your vectorizer only recognized <b>{len(matching_words)} out of {len(words)} words</b>. 
+                                    Because the vocabulary doesn't match the training data, the vector is almost empty, 
+                                    forcing the model to default to its baseline mathematical bias (which is often to predict 'Fake'). 
+                                    Ensure you aren't resetting the vectorizer using <code>fit_transform()</code> in your deployment code!
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.success(f"✅ Healthy Vocabulary Overlap: **{overlap_percent:.1%}** of the words matched words in the vectorizer vocabulary.")
+                        
+                        # Expandable lists for detailed debugging
+                        with st.expander("Show detailed word-by-word vocabulary audit"):
+                            col_word1, col_word2 = st.columns(2)
+                            with col_word1:
+                                st.subheader("Words Recognized:")
+                                st.write(list(set(matching_words)) if matching_words else "None")
+                            with col_word2:
+                                st.subheader("Words Ignored/Unknown:")
+                                st.write(list(set(ignored_words)) if ignored_words else "None")
+                    else:
+                        st.info("ℹ️ Vocabulary extracted, but vocabulary set is empty or could not be decoded.")
                 else:
-                    st.success(f"✅ Healthy Vocabulary Overlap: **{overlap_percent:.1%}** of the words matched words in the vectorizer vocabulary.")
-                
-                # Expandable lists for detailed debugging
-                with st.expander("Show detailed word-by-word vocabulary audit"):
-                    col_word1, col_word2 = st.columns(2)
-                    with col_word1:
-                        st.subheader("Words Recognized:")
-                        st.write(list(set(matching_words)) if matching_words else "None")
-                    with col_word2:
-                        st.subheader("Words Ignored/Unknown:")
-                        st.write(list(set(ignored_words)) if ignored_words else "None")
+                    st.info("ℹ️ Vocabulary overlap diagnostics are unavailable because your custom model uses an encapsulated internal vectorizer that couldn't be extracted. Prediction features are still active!")
                         
                 # ── SECTION C: Troubleshooting Recommendations ───────────────
                 st.markdown("### 🛠️ Recommended Action Items")
@@ -346,15 +389,20 @@ with col_main:
                         "⚖️ **Close Classification Margin:** The model calculated a near-fifty-fifty probability. Adjusting the **Decision Threshold Slider** on the sidebar can help calibrate this app for strict vs relaxed criteria."
                     )
                 
-                if not is_custom_model and bias_toggle:
+                if "1." in model_source and bias_toggle:
                     recommendations.append(
                         "💡 **Experience Bias:** Try toggling off 'Introduce Reuters Trap Bias' on the sidebar. This will retrain the internal model on cleaned data. Analyze the exact same text again and watch the score become balanced!"
                     )
                 
                 if is_custom_model:
-                    recommendations.append(
-                        "📦 **Deployment Audit:** Since you're running a custom model, make sure you used `vectorizer.transform()` inside your Streamlit code, and never `fit_transform()`. Re-fitting the vectorizer is the #1 reason why deployed models classify everything as Fake."
-                    )
+                    if is_pipeline:
+                        recommendations.append(
+                            "📦 **Pipeline Verified:** Your model was detected as an active Scikit-Learn Pipeline. It is receiving raw text and transforming it internally. This eliminates the chance of the 'Vectorizer Re-Fitting Bug', meaning your 'All Fake' issue is likely caused by **Reuters Trap bias** or **Severe Class Imbalance** during your offline training stage."
+                        )
+                    else:
+                        recommendations.append(
+                            "📦 **Standalone Model Audit:** Since you are using a separate vectorizer, make sure your Streamlit file uses `vectorizer.transform()` and never `fit_transform()`. Calling `fit_transform()` resets the internal feature mapping and will make your custom model classify everything as Fake."
+                        )
                 
                 if not recommendations:
                     recommendations.append("✅ **No obvious visual artifacts found.** Your model is responding confidently with consistent vocabulary overlap!")
@@ -364,4 +412,4 @@ with col_main:
                     
             except Exception as eval_err:
                 st.error(f"⚠️ Prediction Error: {eval_err}")
-                st.info("This is often caused by a shape mismatch between the model and vectorizer. Ensure both files were saved at the exact same step during training.")
+                st.info("If your file is a pipeline, ensure that you do not pass a vectorized matrix to it. If it is a standalone model, make sure your vectorizer matches the input size expected by the model.")
